@@ -1,9 +1,14 @@
 #include "offline.h"
 #include "productname.h"
+#include "readiness.h"
 #include "recipe.h"
 
+#include <QDir>
+#include <QFile>
+#include <QFileInfo>
 #include <QJsonArray>
 #include <QProcessEnvironment>
+#include <QTemporaryDir>
 #include <QTest>
 
 class BackendTest : public QObject
@@ -20,6 +25,10 @@ private slots:
     void productNameParsing_data();
     void productNameParsing();
     void offlineCommandHelpers();
+    void readinessStampFormat();
+    void readinessStampUnknownPage();
+    void readinessStampRejectsBadDir();
+    void readinessStampReplacesPrevious();
 };
 
 void BackendTest::recipeDefaults()
@@ -188,6 +197,76 @@ void BackendTest::offlineCommandHelpers()
     } else {
         QCOMPARE(hostWrapped, raw);
     }
+}
+
+namespace {
+QByteArray readStamp(const QString &dir)
+{
+    QFile f(QDir(dir).filePath(QStringLiteral("tuna-installer-ready")));
+    return f.open(QIODevice::ReadOnly) ? f.readAll() : QByteArray();
+}
+} // namespace
+
+// The smoke test parses this file over SSH, so the exact keys, their order and
+// the three-decimal seconds format are a contract.
+void BackendTest::readinessStampFormat()
+{
+    QTemporaryDir dir;
+    QVERIFY(dir.isValid());
+
+    QVERIFY(readiness::writeStamp(dir.path(), QStringLiteral("welcome"), 1700000000500));
+
+    QCOMPARE(readStamp(dir.path()),
+             QByteArray("app_id=org.tunaos.InstallerKde\n"
+                        "window=ApplicationWindow\n"
+                        "signal=frame-swapped\n"
+                        "mapped_at=1700000000.500\n"
+                        "page=welcome\n"));
+}
+
+// A bare `page=` would parse downstream as a real page named "".
+void BackendTest::readinessStampUnknownPage()
+{
+    QTemporaryDir dir;
+    QVERIFY(dir.isValid());
+
+    QVERIFY(readiness::writeStamp(dir.path(), QString(), 1700000000500));
+
+    const QByteArray body = readStamp(dir.path());
+    QVERIFY(body.endsWith("page=unknown\n"));
+    QVERIFY(!body.contains("page=\n"));
+}
+
+// Best-effort: an empty or unwritable runtime dir reports failure and leaves
+// nothing behind instead of throwing or creating the directory.
+void BackendTest::readinessStampRejectsBadDir()
+{
+    QVERIFY(!readiness::writeStamp(QString(), QStringLiteral("welcome"), 1700000000500));
+
+    QTemporaryDir dir;
+    QVERIFY(dir.isValid());
+    const QString missing = QDir(dir.path()).filePath(QStringLiteral("missing"));
+
+    QVERIFY(!readiness::writeStamp(missing, QStringLiteral("welcome"), 1700000000500));
+    QVERIFY(!QFileInfo::exists(missing));
+}
+
+// A second stamp replaces the first rather than appending, and the atomic
+// write leaves no temporary file next to it.
+void BackendTest::readinessStampReplacesPrevious()
+{
+    QTemporaryDir dir;
+    QVERIFY(dir.isValid());
+
+    QVERIFY(readiness::writeStamp(dir.path(), QStringLiteral("welcome"), 1700000000500));
+    QVERIFY(readiness::writeStamp(dir.path(), QStringLiteral("done"), 1700000001500));
+
+    const QByteArray body = readStamp(dir.path());
+    QVERIFY(body.contains("page=done\n"));
+    QVERIFY(body.contains("mapped_at=1700000001.500\n"));
+    QVERIFY(!body.contains("welcome"));
+    QCOMPARE(QDir(dir.path()).entryList(QDir::Files),
+             QStringList{QStringLiteral("tuna-installer-ready")});
 }
 
 QTEST_APPLESS_MAIN(BackendTest)
